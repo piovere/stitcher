@@ -59,7 +59,6 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
-<<<<<<< HEAD
-=======
 
->>>>>>> 0d344b93150324aea6ff39458a2233c074876d72
+# Project files:
+*.komodoproject
