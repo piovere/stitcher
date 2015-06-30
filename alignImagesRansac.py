@@ -10,6 +10,7 @@ import numpy as np
 
 from numpy import linalg
 
+VERBOSE = 1
 
 
 class AlignImagesRansac(object):
@@ -24,6 +25,10 @@ class AlignImagesRansac(object):
         '''
 
         self.key_frame_file = os.path.split(key_frame)[-1]
+        if not os.path.exists(output_dir):
+            os.mkdir(output_dir)
+        elif not os.path.isdir(output_dir):
+            raise RuntimeWarning("output_dir is not a directory: %s" % output_dir)
         self.output_dir = output_dir
 
 
@@ -163,7 +168,20 @@ class AlignImagesRansac(object):
         # Find the best next image from the remaining images
         for next_img_path in self.dir_list:
 
-            print("Reading next image: %s ..." % next_img_path)
+            # TODO: Optimization. If we find an image that is "good enough", perhaps
+            # just use this, without going through the whole list.
+            # For instance, if the inliers fraction is > 0.50 then it is a pretty good match.
+            # In fact, even > 0.30 is pretty good.
+            # Alternatively, as you go through the whole list, save the scores.
+            # Then at the end, start by re-calculating only for a subset of the
+            # images above a certain threshold.
+            # This will postpone calculation of distant/unrelevant images,
+            # using initial calculations to focus on good candidates.
+            # You could do both - and also sort the images by their similarity score.
+            # TODO: Refactor this into separate "find candidate" and "merge images" functions.
+
+            if VERBOSE > 1:
+                print("Reading next image: %s ..." % next_img_path)
 
             if self.key_frame_file in next_img_path:
                 print("\t Skipping %s..." % self.key_frame_file)
@@ -177,39 +195,48 @@ class AlignImagesRansac(object):
             #     print("\t Skipping %s, bad shape: %s" % (next_img_path, next_img.shape)
             #     continue
 
-            print("\t Finding points...")
+            if VERBOSE > 1:
+                print("\t Finding points...")
 
             # Find points in the next frame
             next_features, next_descs = detector.detectAndCompute(next_img, None)
 
             matches = matcher.knnMatch(next_descs, trainDescriptors=base_descs, k=2)
 
-            print("\t Match Count: ", len(matches))
+            if VERBOSE > 1:
+                print("\t Match Count: ", len(matches))
 
             matches_subset = self.filter_matches(matches)
 
-            print("\t Filtered Match Count: ", len(matches_subset))
+            if VERBOSE > 1:
+                print("\t Filtered Match Count: ", len(matches_subset))
 
             distance = self.imageDistance(matches_subset)
 
-            print("\t Distance from Key Image: ", distance)
+            if VERBOSE > 1:
+                print("\t Distance from Key Image: ", distance)
 
             averagePointDistance = distance/float(len(matches_subset))
 
-            print("\t Average Distance: ", averagePointDistance)
+            if VERBOSE > 1:
+                print("\t Average Distance: ", averagePointDistance)
 
-            kp1 = []
-            kp2 = []
+            #kp1 = []
+            #kp2 = []
+            #
+            #for match in matches_subset:
+            #    kp1.append(base_features[match.trainIdx])
+            #    kp2.append(next_features[match.queryIdx])
 
-            for match in matches_subset:
-                kp1.append(base_features[match.trainIdx])
-                kp2.append(next_features[match.queryIdx])
+            kp1, kp2 = zip(*((base_features[match.trainIdx], next_features[match.queryIdx]) for match in matches_subset))
 
-            p1 = np.array([k.pt for k in kp1])
-            p2 = np.array([k.pt for k in kp2])
+            #p1 = np.array([k.pt for k in kp1])
+            #p2 = np.array([k.pt for k in kp2])
+            p1, p2 = [np.array([k.pt for k in kps]) for kps in (kp1, kp2)]
 
             H, status = cv2.findHomography(p1, p2, cv2.RANSAC, 5.0)
-            print('%d / %d  inliers/matched' % (np.sum(status), len(status)))
+            if VERBOSE > 1:
+                print('%d / %d  inliers/matched' % (np.sum(status), len(status)))
 
             inlierRatio = float(np.sum(status)) / float(len(status))
 
@@ -228,84 +255,148 @@ class AlignImagesRansac(object):
 
         print("Closest Image: ", closestImage['path'])
         print("Closest Image Ratio: ", closestImage['inliers'])
-
-        #self.dir_list = filter(lambda x: x != closestImage['path'], self.dir_list)
         self.dir_list = [x for x in self.dir_list if x != closestImage['path']]
+        if closestImage['inliers'] < 0.1:
+            # No suitable candidates...
+            # return self.stitchImages(base_img_rgb, round+1)
+            # Uh... if we didn't find any candidates here, we're not gonna find it in any other rounds either.
+            # Probably just abort and return?
+            print("Closest image doesn't pass criteria. Stopping here...")
+            return base_img_rgb
+
 
         # utils.showImage(closestImage['img'], scale=(0.2, 0.2), timeout=0)
         # cv2.destroyAllWindows()
 
+        # Calculate inverse homography matrix:
         H = closestImage['h']
-        H = H / H[2, 2]
+        H = H / H[2, 2]         # Normalize
         H_inv = linalg.inv(H)
 
-        if closestImage['inliers'] > 0.1: # and
+        # If h31 = h32 = 0 are close to 0 and h33 = 1, then we have an affine homography.
+        # We use zero-based indices, so H[2,0], H[2,1] and H[2,2]
+        if max(H[2,0], H[2,1]) < 1e-5 and H[2,2] > (1-1e-4):
+            H[2,0] = H[2,1] = 0
+            H[2,2] = 1
+            print("Closest img homography is affine.")
+            is_affine = True
 
-            (min_x, min_y, max_x, max_y) = self.findDimensions(closestImage['img'], H_inv)
+        # Homogeneous point in 2D plane: (x1, x2, x3), where x=x1/x3, y=x2/x3. Typically (x, y, 1).
+        # Isometry (preserves Euclidian distances):
+        # [[R, t],
+        #   O, 1]]
+        # where R is 2x2 rotation matrix, t is 2x1 translation vector, O is zeros.
+        # If R is close to [[1,0], [0,1]], then there is no rotation or scaling.
+        # If R is close to [[s,0], [0,s]], then there is scaling but no rotation.
+        if np.isclose(H[0, 0], H[1, 1], rtol=1e-4, atol=1e-4) \
+            and np.isclose(H[0, 1], 0, rtol=1e-4, atol=1e-4)\
+            and np.isclose(H[1, 0], 0, rtol=1e-4, atol=1e-4):
+            # We have no rotation:
+            print("Closest img homography is un-rotated.")
+            H[0, 1] = H[1, 0] = 0
+            if np.isclose(H[0, 0], 1, rtol=1e-4, atol=1e-4):
+                # Is isometric, since H[1,0]==H[0,1]==0:
+                H[0, 0] = H[1, 1] = 1
+                print("Closest img homography is isometric.")
+            else:
+                H[0, 0] = H[1, 1] = sum((H[0, 0], H[1, 1]))/2
+        # Might still be isometric, if H[0:2,0:2] describes a rotation matrix...
+        # This will be the case if H[0,1] == -H[1,0] and H[0,0] == -H[1,1] and
+        # sqrt(H[0,0]**2 + H[1,0]**2) == 1
 
-            # Adjust max_x and max_y by base img size
-            max_x = max(max_x, base_img.shape[1])
-            max_y = max(max_y, base_img.shape[0])
+        # Determine if closestImg will enlarge the final, combined image:
+        (min_x, min_y, max_x, max_y) = self.findDimensions(closestImage['img'], H_inv)
+        # Adjust max_x and max_y by base img size
+        max_x = max(max_x, base_img.shape[1])
+        max_y = max(max_y, base_img.shape[0])
 
-            move_h = np.matrix(np.identity(3), np.float32)
+        # Translation part of the homography matrix:
+        move_h = np.matrix(np.identity(3), np.float32) # 3x3 matrix
+        if min_x < 0:
+            # if closestImg will enlarge the combined image to the left.
+            move_h[0, 2] += -min_x
+            max_x += -min_x
+        if min_y < 0:
+            # if closestImg will enlarge the combined image to the top.
+            move_h[1, 2] += -min_y
+            max_y += -min_y
 
-            if min_x < 0:
-                move_h[0, 2] += -min_x
-                max_x += -min_x
+        print("Homography: \n", H)
+        print("Inverse Homography: \n", H_inv)
+        print("Min Points: ", (min_x, min_y))
+        print("Max Points: ", (max_x, max_y))
 
-            if min_y < 0:
-                move_h[1, 2] += -min_y
-                max_y += -min_y
+        mod_inv_h = move_h * H_inv
 
-            print("Homography: \n", H)
-            print("Inverse Homography: \n", H_inv)
-            print("Min Points: ", (min_x, min_y))
+        # Attempting to eliminate the thin black border:
+        img_w = int(max_x) # int(math.ceil(max_x))
+        img_h = int(max_y) # int(math.ceil(max_y))
+        print("img_w, img_h vs math.ceil(max_x, max_y): (%s, %s) vs (%s, %s)" % \
+              (img_w, img_h, math.ceil(max_x), math.ceil(max_y)))
 
-            mod_inv_h = move_h * H_inv
+        print("New Dimensions: ", (img_w, img_h))
 
-            img_w = int(math.ceil(max_x))
-            img_h = int(math.ceil(max_y))
+        # Warp the new image given the homography from the old image
+        # Strictly speaking, you could just use warpAffine providing move_h as a 2x3 transformation matrix
+        # http://docs.opencv.org/modules/imgproc/doc/geometric_transformations.html
+        base_img_warp = cv2.warpPerspective(base_img_rgb, move_h, (img_w, img_h))
+        print("Warped base image")
 
-            print("New Dimensions: ", (img_w, img_h))
+        # utils.showImage(base_img_warp, scale=(0.2, 0.2), timeout=5000)
+        # cv2.destroyAllWindows()
 
-            # Warp the new image given the homography from the old image
-            base_img_warp = cv2.warpPerspective(base_img_rgb, move_h, (img_w, img_h))
-            print("Warped base image")
+        next_img_warp = cv2.warpPerspective(closestImage['rgb'], mod_inv_h, (img_w, img_h))
+        print("Warped next image")
 
-            # utils.showImage(base_img_warp, scale=(0.2, 0.2), timeout=5000)
-            # cv2.destroyAllWindows()
+        # utils.showImage(next_img_warp, scale=(0.2, 0.2), timeout=5000)
+        # cv2.destroyAllWindows()
 
-            next_img_warp = cv2.warpPerspective(closestImage['rgb'], mod_inv_h, (img_w, img_h))
-            print("Warped next image")
+        # Put the base image on an enlarged palette
+        # TODO: Is this really the best way to do this?
+        enlarged_base_img = np.zeros((img_h, img_w, 3), np.uint8)
 
-            # utils.showImage(next_img_warp, scale=(0.2, 0.2), timeout=5000)
-            # cv2.destroyAllWindows()
+        print("Enlarged Image Shape: ", enlarged_base_img.shape)
+        print("Base Image Shape: ", base_img_rgb.shape)
+        print("Base Image Warp Shape: ", base_img_warp.shape)
 
-            # Put the base image on an enlarged palette
-            enlarged_base_img = np.zeros((img_h, img_w, 3), np.uint8)
+        # enlarged_base_img[y:y+base_img_rgb.shape[0],x:x+base_img_rgb.shape[1]] = base_img_rgb
+        # enlarged_base_img[:base_img_warp.shape[0],:base_img_warp.shape[1]] = base_img_warp
 
-            print("Enlarged Image Shape: ", enlarged_base_img.shape)
-            print("Base Image Shape: ", base_img_rgb.shape)
-            print("Base Image Warp Shape: ", base_img_warp.shape)
+        # Create a mask from the warped image for constructing masked composite
+        (ret, data_map) = cv2.threshold(cv2.cvtColor(next_img_warp, cv2.COLOR_BGR2GRAY),
+                                        0, 255, cv2.THRESH_BINARY)
 
-            # enlarged_base_img[y:y+base_img_rgb.shape[0],x:x+base_img_rgb.shape[1]] = base_img_rgb
-            # enlarged_base_img[:base_img_warp.shape[0],:base_img_warp.shape[1]] = base_img_warp
+        enlarged_base_img = cv2.add(enlarged_base_img, base_img_warp,
+                                    #mask=np.bitwise_not(data_map),
+                                    dtype=cv2.CV_8U)
 
-            # Create a mask from the warped image for constructing masked composite
-            (ret, data_map) = cv2.threshold(cv2.cvtColor(next_img_warp, cv2.COLOR_BGR2GRAY),
-                                            0, 255, cv2.THRESH_BINARY)
+        #enlarged_base_img = cv2.addWeighted(enlarged_base_img, 1.0,
+        #                                    base_img_warp, 0.5,
+        #                                    gamma=0,
+        #                                    mask=data_map,
+        #                                    dtype=cv2.CV_8U)
 
-            enlarged_base_img = cv2.add(enlarged_base_img, base_img_warp,
-                                        mask=np.bitwise_not(data_map),
-                                        dtype=cv2.CV_8U)
+        # Now add the warped image
+        #final_img = cv2.add(enlarged_base_img, next_img_warp,
+        #                    dtype=cv2.CV_8U)
 
-            # Now add the warped image
-            final_img = cv2.add(enlarged_base_img, next_img_warp,
-                                dtype=cv2.CV_8U)
+        # Wouldn't it be simpler just to not have a mask and simply replace the pixels
+        # of enlarged_base_img with the pixels from next_img_warp?
+        # E.g. by using "lighten" image blend mode, instead of a mask:
+        # np.maximum(enlarged_base_img, next_img_warp)
+        # Alternatively, use OpenCV's per-element operations:
+        # http://docs.opencv.org/modules/core/doc/operations_on_arrays.html#max
+        # http://docs.opencv.org/modules/gpu/doc/per_element_operations.html
+        # If you want "fractional" blending, you have to first calculate the diff,
+        # then zero-out negative values, then multiply with the fraction and then add.
+        final_img = cv2.max(enlarged_base_img, next_img_warp)
 
-            # utils.showImage(final_img, scale=(0.2, 0.2), timeout=0)
-            # cv2.destroyAllWindows()
 
+        # utils.showImage(final_img, scale=(0.2, 0.2), timeout=0)
+        # cv2.destroyAllWindows()
+
+        eliminate_contours = False
+        if eliminate_contours:
             # Crop off the black edges
             final_gray = cv2.cvtColor(final_img, cv2.COLOR_BGR2GRAY)
             _, thresh = cv2.threshold(final_gray, 1, 255, cv2.THRESH_BINARY)
@@ -340,15 +431,13 @@ class AlignImagesRansac(object):
 
                 final_img = final_img_crop
 
-            # Write out the current round
-            final_filename = "%s/%d.JPG" % (self.output_dir, round)
-            cv2.imwrite(final_filename, final_img)
+        # Write out the current round
+        output_filetype = "PNG"
+        final_filename = "%s/%d.%s" % (self.output_dir, round, output_filetype)
+        cv2.imwrite(final_filename, final_img)
 
-            return self.stitchImages(final_img, round+1)
+        return self.stitchImages(final_img, round+1)
 
-        else:
-
-            return self.stitchImages(base_img_rgb, round+1)
 
 
 
