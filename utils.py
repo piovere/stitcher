@@ -19,7 +19,7 @@ def imageDistance(matches):
 
     return sumDistance
 
-def findDimensions(self, image, homography):
+def findDimensions(image, homography):
     base_p1 = np.ones(3, np.float32)
     base_p2 = np.ones(3, np.float32)
     base_p3 = np.ones(3, np.float32)
