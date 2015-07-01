@@ -71,7 +71,9 @@ class AlignImagesRansac(object):
         # utils.showImage(base_img_rgb, scale=(0.2, 0.2), timeout=0)
         # cv2.destroyAllWindows()
 
-        # I believe these are both re-usable:
+        ## I believe feature detector and matcher are both re-usable: ##
+
+        # Use the SIFT feature detector
         self.detector = cv2.SIFT()
 
         # Parameters for nearest-neighbor matching
@@ -79,27 +81,48 @@ class AlignImagesRansac(object):
         flann_params = {"algorithm": FLANN_INDEX_KDTREE, "trees": 5}
         self.matcher = cv2.FlannBasedMatcher(flann_params, {})
 
-
         final_img = self.stitchImages(base_img_rgb, 0)
 
 
+    def calculate_homography_stats(self, base_features, base_descs, next_img_path):
+        # Read in the next image...
+        next_img_rgb = cv2.imread(next_img_path)
+        next_img = cv2.GaussianBlur(cv2.cvtColor(next_img_rgb, cv2.COLOR_BGR2GRAY), (5, 5), 0)
 
-    def stitchImages(self, base_img_rgb, round=0):
-        """
-        Recursively stitch images in self.dir_list together, starting with base_img_rgb.
-        Finds the closest image match of the (remaining) files in self.dir_list and
-        combines that image with base_img_rgb.
-        """
+        # Find points in the next frame
+        next_features, next_descs = self.detector.detectAndCompute(next_img, None)
+        matches = self.matcher.knnMatch(next_descs, trainDescriptors=base_descs, k=2)
+        matches_subset = utils.filter_matches(matches)
+        distance = utils.imageDistance(matches_subset)
+        averagePointDistance = distance/len(matches_subset)
+        kp1, kp2 = zip(*((base_features[match.trainIdx], next_features[match.queryIdx]) for match in matches_subset))
+        p1, p2 = [np.array([k.pt for k in kps]) for kps in (kp1, kp2)]
+        H, status = cv2.findHomography(p1, p2, cv2.RANSAC, 5.0)
+        inlierRatio = np.sum(status)/len(status)
 
-        if not self.dir_list:
-            print("Dir list is exhausted - all done.")
-            return base_img_rgb
+        if VERBOSE > 1:
+            print("Homography stats for next image candidate: %s ..." % next_img_path)
+            print("\t Finding points...")
+            print("\t Match Count: ", len(matches))
+            print("\t Filtered Match Count: ", len(matches_subset))
+            print("\t Distance from Key Image: ", distance)
+            print("\t Average Distance: ", averagePointDistance)
+            print('%d / %d  inliers/matched' % (np.sum(status), len(status)))
 
-        base_img = cv2.GaussianBlur(cv2.cvtColor(base_img_rgb, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+        stats = {'h': H,
+                 'inliers': inlierRatio,
+                 'dist': averagePointDistance,
+                 'path': next_img_path,
+                 'rgb': next_img_rgb,
+                 'img': next_img,
+                 'feat': next_features,
+                 'desc': next_descs,
+                 'match': matches_subset
+                }
+        return stats
 
-        # Use the SIFT feature detector
-        #detector = cv2.SIFT()
 
+    def find_closest_image(self, base_img):
         # Find key points in base image for motion estimation
         base_features, base_descs = self.detector.detectAndCompute(base_img, None)
 
@@ -109,7 +132,6 @@ class AlignImagesRansac(object):
             key_points = [(int(kp.pt[0]),int(kp.pt[1])) for kp in base_features]
             utils.showImage(base_img, key_points, scale=(0.2, 0.2), timeout=0)
             cv2.destroyAllWindows()
-
 
         print("Iterating through next images...")
 
@@ -133,52 +155,39 @@ class AlignImagesRansac(object):
             # TODO: Refactor this into separate "find candidate" and "merge images" functions.
             # TODO: Maybe load the images once and then keep them in memory?
 
-            if VERBOSE > 1:
-                print("Reading next image: %s ..." % next_img_path)
-
             if self.key_frame_file in next_img_path:
                 print("\t Skipping keyframe image %s..." % self.key_frame_file)
                 continue
-
-            # Read in the next image...
-            next_img_rgb = cv2.imread(next_img_path)
-            next_img = cv2.GaussianBlur(cv2.cvtColor(next_img_rgb, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-
-            # Find points in the next frame
-            next_features, next_descs = self.detector.detectAndCompute(next_img, None)
-            matches = self.matcher.knnMatch(next_descs, trainDescriptors=base_descs, k=2)
-            matches_subset = utils.filter_matches(matches)
-            distance = utils.imageDistance(matches_subset)
-            averagePointDistance = distance/len(matches_subset)
-            kp1, kp2 = zip(*((base_features[match.trainIdx], next_features[match.queryIdx]) for match in matches_subset))
-            p1, p2 = [np.array([k.pt for k in kps]) for kps in (kp1, kp2)]
-            H, status = cv2.findHomography(p1, p2, cv2.RANSAC, 5.0)
-            inlierRatio = np.sum(status)/len(status)
-
-            if VERBOSE > 1:
-                print("\t Finding points...")
-                print("\t Match Count: ", len(matches))
-                print("\t Filtered Match Count: ", len(matches_subset))
-                print("\t Distance from Key Image: ", distance)
-                print("\t Average Distance: ", averagePointDistance)
-                print('%d / %d  inliers/matched' % (np.sum(status), len(status)))
+            homography_stats = self.calculate_homography_stats(base_features, base_descs, next_img_path)
 
             # What is the best scoring criteria? inlierRatio or averagePointDistance?
-            if closestImage is None or inlierRatio > closestImage['inliers']:
-                closestImage = {'h': H,
-                                'inliers': inlierRatio,
-                                'dist': averagePointDistance,
-                                'path': next_img_path,
-                                'rgb': next_img_rgb,
-                                'img': next_img,
-                                'feat': next_features,
-                                'desc': next_descs,
-                                'match': matches_subset
-                               }
+            if closestImage is None or homography_stats['inliers'] > closestImage['inliers']:
+                closestImage = homography_stats
+                if homography_stats['inliers'] > self.score_max:
+                    print("%s is above score_max, combining immediately." % next_img_path)
+                    break
 
         print("Closest Image: ", closestImage['path'])
         print("Closest Image Ratio: ", closestImage['inliers'])
         self.dir_list = [x for x in self.dir_list if x != closestImage['path']]
+        return closestImage
+
+
+    def stitchImages(self, base_img_rgb, round=0):
+        """
+        Recursively stitch images in self.dir_list together, starting with base_img_rgb.
+        Finds the closest image match of the (remaining) files in self.dir_list and
+        combines that image with base_img_rgb.
+        """
+
+        if not self.dir_list:
+            print("Dir list is exhausted - all done.")
+            return base_img_rgb
+
+        base_img = cv2.GaussianBlur(cv2.cvtColor(base_img_rgb, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+
+        closestImage = self.find_closest_image(base_img)
+
         if closestImage['inliers'] < self.score_min:
             # No suitable candidates...
             # Uh... if we didn't find any candidates here, we're not gonna find it in any other rounds either.
