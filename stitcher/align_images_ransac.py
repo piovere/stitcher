@@ -3,12 +3,15 @@
 from __future__ import print_function, division, absolute_import
 import os
 import sys
+from fnmatch import fnmatch
 import cv2
 import math
 import numpy as np
 from numpy import linalg
+import logging
+logger = logging.getLogger(__name__)
 
-import utils
+from . import utils
 
 
 VERBOSE = 1
@@ -23,7 +26,8 @@ def align_images_ransac(*args, **kwargs):
 
 class AlignImagesRansac(object):
 
-    def __init__(self, image_dir=None, key_frame=None, output_dir=None, include_pattern=None,
+    def __init__(self, image_dir=None, key_frame=None, output_dir=None,
+                 input_images=None, include_pattern=None,
                  score_max=0.7, score_min=0.1,
                  selection_score=0.4, selection_count_min=1,
                  output_filetype="PNG", output_fnfmt="{iteration}.{output_filetype}",
@@ -57,35 +61,62 @@ class AlignImagesRansac(object):
         self.next_img_scores = {}
         self.key_frame_filepath = key_frame
         self.key_frame_basename = os.path.basename(key_frame) if key_frame else None
-        self.image_dir = image_dir
+        self.image_dir = image_dir or "." if not input_images else None
+        self.dir_list = input_images or []
         self.include_pattern = include_pattern
+        self.kwargs = kwargs
+
+
+    def get_image_dir_files(self):
+        # Open the directory given in the arguments
+        try:
+            image_dir_filenames = os.listdir(self.image_dir)
+        except OSError:
+            print("Unable to open directory: %s" % self.image_dir)
+            sys.exit(-1)
+        # Filter input-dir filenames:
+        if self.include_pattern:
+            # remove all files that doen't end with .[image_filter]
+            # TODO: Use glob or fnmatch-based filtering instead.
+            if self.kwargs.get("include_pattern_fnmatch"):
+                image_dir_filenames = [fn for fn in image_dir_filenames if fnmatch(fn, self.include_pattern)]
+            else:
+                image_dir_filenames = [fn for fn in image_dir_filenames if self.include_pattern in fn]
+        if 'Thumbs.db' in self.dir_list: # always remove Thumbs.db (windows only)
+            image_dir_filenames.remove('Thumbs.db')
+        # Join to get filepaths:
+        filelist = [os.path.join(self.image_dir, fn) for fn in image_dir_filenames]
+        nbefore = len(filelist)
+        filelist = [fpath for fpath in filelist if os.path.isfile(fpath)]
+        logger.debug("Files before/after filtering actual files: %s/%s", nbefore, len(filelist))
+        return filelist
 
 
     def start_image_stitching(self, key_frame=None):
+        """
+        Find input images in dir_list and start stitching process.
+        """
 
-
+        ## Assert that we have a good output dir:
         if not os.path.exists(self.output_dir):
             os.mkdir(self.output_dir)
         elif not os.path.isdir(self.output_dir):
             raise RuntimeWarning("output_dir is not a directory: %s" % self.output_dir)
 
-        # Open the directory given in the arguments
-        try:
-            self.dir_list = os.listdir(self.image_dir)
-        except OSError:
-            print("Unable to open directory: %s" % self.image_dir)
-            sys.exit(-1)
 
-        if self.include_pattern:
-            # remove all files that doen't end with .[image_filter]
-            # TODO: Use glob or fnmatch-based filtering instead.
-            self.dir_list = [fn for fn in self.dir_list if fn.find(self.include_pattern)]
-        if 'Thumbs.db' in self.dir_list: #remove Thumbs.db (windows only)
-            self.dir_list.remove('Thumbs.db')
+        if self.image_dir:
+            image_dir_files = self.get_image_dir_files()
+            logger.debug("image_dir_files: %s", image_dir_files)
+            if not image_dir_files:
+                print("No matching files was found in the image directory:", self.image_dir)
+            self.dir_list += image_dir_files
 
-        self.dir_list = [os.path.join(self.image_dir, fn) for fn in self.dir_list]
         # Filter out anything that is not a file:
         self.dir_list = [fpath for fpath in self.dir_list if os.path.isfile(fpath)]
+        logger.info("Processing %s files...", len(self.dir_list))
+        if not self.dir_list:
+            print("Input image file list is empty (%s) - aborting image stitching" % self.dir_list)
+            return
 
         if key_frame is None:
             key_frame = self.key_frame_filepath

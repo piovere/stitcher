@@ -11,6 +11,7 @@ Script for boot-strapping and executing image stitcher from command line.
 
 from __future__ import print_function, division, absolute_import
 import os
+import sys
 import glob
 import argparse
 import yaml
@@ -18,7 +19,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-from alignImagesRansac import AlignImagesRansac
+try:
+    from stitcher.align_images_ransac import AlignImagesRansac
+except ImportError:
+    # Add lib dir to system path:
+    LIBDIRPATH = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    logger.debug("Appending sys.path with LIBDIRPATH: %s", LIBDIRPATH)
+    sys.path.insert(0, LIBDIRPATH)
+    from stitcher.align_images_ransac import AlignImagesRansac
 
 
 
@@ -31,7 +39,10 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Image Stitcher - stitching images together since 2015.")
     parser.add_argument("--verbose", "-v", action="count", help="Increase verbosity.")
     parser.add_argument("--testing", action="store_true", help="Run app in simple test mode.")
-    parser.add_argument("--loglevel", default=logging.DEBUG, help="Set logging output threshold level.")
+    parser.add_argument("--loglevel", default=logging.INFO, help="Set logging output threshold level.")
+    parser.add_argument("--logformat",
+                        default="%(asctime)s %(levelname)-5s %(name)12s:%(lineno)-4s%(funcName)16s() %(message)s",
+                        help="Set logging output format.")
 
     parser.add_argument("--no-merge-lowres", action="store_false", dest="merge_lowres",
                         help="Do not merge low-res images.")
@@ -46,10 +57,15 @@ def parse_args(argv=None):
                         help="Instead of providing a bunch of command line arguments at the command line, "
                         "you can read arguments from a dictionary stored as a yaml file).")
 
-    parser.add_argument("--image-dir", "-d", default=".",
+    parser.add_argument("--input-images", "-i", nargs="*",
                         help="Load images from this directory. Default is current directory.")
+    parser.add_argument("--image-dir", "-d",
+                        help="Load images from this directory. "\
+                             "Default is current directory, unless input-images is provided.")
     parser.add_argument("--include-pattern",
                         help="Only include files matching this/these pattern(s).")
+    parser.add_argument("--include-pattern-fnmatch", action="store_true",
+                        help="Use 'fnmatch'-style matching with wild-card operators instead of simple string search.")
 
     parser.add_argument("--output-dir", "-o", default="stitched-output",
                         help="Output the stitched/combined images to this directory.")
@@ -110,21 +126,21 @@ def process_args(argns):
         except ValueError:
             args["loglevel"] = getattr(logging, args["loglevel"])
 
-    ## On windows, we have to expand glob patterns manually:
-    #file_pattern_matches = [(pattern, glob.glob(os.path.expanduser(pattern))) for pattern in args['basedirs']]
-    #for pattern in (pattern for pattern, res in file_pattern_matches if len(res) == 0):
-    #    print("WARNING: File/pattern '%s' does not match any files." % pattern)
-    #args['basedirs'] = [fname for pattern, res in file_pattern_matches for fname in res]
-
-    #if args.get("ignorefile"):
-    #    args['ignorefile'] = os.path.expanduser(args['ignorefile'])
+    # On Windows we have to expand glob patterns manually:
+    # Also warn user if a pattern does not match any files
+    if args.get('input_images'):
+        file_pattern_matches = [(pattern, glob.glob(os.path.expanduser(pattern))) for pattern in args['input_images']]
+        for pattern in (pattern for pattern, res in file_pattern_matches if len(res) == 0):
+            print("WARNING: File/pattern '%s' does not match any files." % pattern)
+        args['input_images'] = [fname for pattern, res in file_pattern_matches for fname in res]
 
     return args
 
 def init_logging(args):
     """ Initialize logging based on args parameters. """
+    default_fmt = "%(asctime)s %(levelname)-5s %(name)12s:%(lineno)-4s%(funcName)16s() %(message)s"
     logging.basicConfig(level=args.get("loglevel", 30),
-                        format="%(asctime)s %(levelname)-5s %(name)12s:%(lineno)-4s%(funcName)16s() %(message)s")
+                        format=args.get("logformat", default_fmt))
 
 
 
@@ -135,9 +151,6 @@ def main(argv=None):
     args = process_args(argns)
     init_logging(args)
     logger.debug("args: %s", args)
-    for a in "image_dir, key_frame, output_dir".split(", "):
-        if a not in args:
-            print(a, "not in args!")
 
     stitcher = AlignImagesRansac(**args)
     stitcher.start_image_stitching()
