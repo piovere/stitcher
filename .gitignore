@@ -5,6 +5,7 @@ doc/
 
 #local tests
 test*
+stitched-output/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -62,3 +63,4 @@ docs/_build/
 
 # Project files:
 *.komodoproject
+pylintrc
