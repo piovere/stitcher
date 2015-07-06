@@ -1,5 +1,9 @@
+
+
+from __future__ import print_function, division, absolute_import
 import cv2
 import numpy as np
+import math
 
 VERBOSE = 1
 
@@ -65,8 +69,26 @@ def findDimensions(image, homography):
 
     return (min_x, min_y, max_x, max_y)
 
+def is_affine(H):
+    return H[2, 0] == 0 and H[2, 1] == 0 and H[2, 2] == 1
 
-def round_homography(H):
+def calc_scalefactors(H):
+    if not is_affine(H):
+        return None
+    scale_x = math.sqrt(H[0, 0]**2 + H[0, 1]**2)
+    scale_y = math.sqrt(H[1, 0]**2 + H[1, 1]**2)
+    return (scale_x, scale_y)
+
+def avg_scalefactor(H):
+    if not is_affine(H):
+        return None
+    scale_x = math.sqrt(H[0, 0]**2 + H[0, 1]**2)
+    scale_y = math.sqrt(H[1, 0]**2 + H[1, 1]**2)
+    scalefactors = calc_scalefactors(H)
+    return sum(scalefactors)/len(scalefactors)
+
+
+def round_homography(H, rtol=1e-3, atol=1e-3):
     """
     Usually, the homography produced is close, but might have errors.
     E.g. If taking two screen shorts of a moved window, the homography
@@ -78,7 +100,7 @@ def round_homography(H):
 
     # If h31 = h32 = 0 are close to 0 and h33 = 1, then we have an affine homography.
     # We use zero-based indices, so H[2,0], H[2,1] and H[2,2]
-    if max(H[2,0], H[2,1]) < 1e-5 and H[2,2] > (1-1e-4):
+    if max(H[2,0], H[2,1]) < atol and H[2,2] > (1-atol):
         H[2,0] = H[2,1] = 0
         H[2,2] = 1
         print("Closest img homography is affine.")
@@ -90,13 +112,13 @@ def round_homography(H):
     # where R is 2x2 rotation matrix, t is 2x1 translation vector, O is zeros.
     # If R is close to [[1,0], [0,1]], then there is no rotation or scaling.
     # If R is close to [[s,0], [0,s]], then there is scaling but no rotation.
-    if np.isclose(H[0, 0], H[1, 1], rtol=1e-4, atol=1e-4) \
-        and np.isclose(H[0, 1], 0, rtol=1e-4, atol=1e-4)\
-        and np.isclose(H[1, 0], 0, rtol=1e-4, atol=1e-4):
+    if np.isclose(H[0, 0], H[1, 1], rtol=rtol, atol=atol) \
+        and np.isclose(H[0, 1], 0, rtol=rtol, atol=atol)\
+        and np.isclose(H[1, 0], 0, rtol=rtol, atol=atol):
         # We have no rotation:
         print("Closest img homography is un-rotated.")
         H[0, 1] = H[1, 0] = 0
-        if np.isclose(H[0, 0], 1, rtol=1e-4, atol=1e-4):
+        if np.isclose(H[0, 0], 1, rtol=1e-4, atol=atol):
             # Is isometric, since H[1,0]==H[0,1]==0:
             H[0, 0] = H[1, 1] = 1
             print("Closest img homography is isometric.")
@@ -108,7 +130,9 @@ def round_homography(H):
     return H
 
 
-def combine_closest_image(base_img_rgb, closestImage, H_inv):
+
+
+def combine_closest_image(base_img_rgb, closestImage, H_inv, prefer_highres=True):
 
     # Determine if closestImg will enlarge the final, combined image:
     (min_x, min_y, max_x, max_y) = findDimensions(closestImage['img'], H_inv)
@@ -116,7 +140,10 @@ def combine_closest_image(base_img_rgb, closestImage, H_inv):
     max_x = max(max_x, base_img_rgb.shape[1])
     max_y = max(max_y, base_img_rgb.shape[0])
 
-    # Translation part of the homography matrix:
+
+    # If the warped next_img will extend beyong the top or left margin of base_img,
+    # then we need to reate a translation matrix to move the base image,
+    # apply this to H_inv, and make adjustments to max_x, max_y
     move_h = np.matrix(np.identity(3), np.float32) # 3x3 matrix
     if min_x < 0:
         # if closestImg will enlarge the combined image to the left.
@@ -126,8 +153,10 @@ def combine_closest_image(base_img_rgb, closestImage, H_inv):
         # if closestImg will enlarge the combined image to the top.
         move_h[1, 2] += -min_y
         max_y += -min_y
-
+    # Make a modified H_inv, which account for canvas translation
     mod_inv_h = move_h * H_inv
+    # When mod_inv_h is applied to next_img, it is transformed to the
+    # right position/rotation/scale/skew/etc to match the base image.
 
     # Attempting to eliminate the thin black border:
     img_w = int(max_x) # int(math.ceil(max_x))
@@ -161,9 +190,51 @@ def combine_closest_image(base_img_rgb, closestImage, H_inv):
         print("Base Image Shape: ", base_img_rgb.shape)
         print("Base Image Warp Shape: ", base_img_warp.shape)
 
-    enlarged_base_img = cv2.add(enlarged_base_img, base_img_warp, dtype=cv2.CV_8U)
 
-    final_img = cv2.max(enlarged_base_img, next_img_warp)
+    # TODO: Option to always place the highest-res image on top (without blending).
+    # Could be done by using the "top" image to create a mask for the "lower" image before blending.
+    ### NOT IMPLEMENTED ###
+    base_img_mask = None
+    next_img_mask = None
+    if prefer_highres is True:
+        # This is the scaling that needs to be applied to next_img to match base_img
+        # Will return None if matrix transform is not affine.
+        scale = avg_scalefactor(H_inv)
+        if scale is not None and scale > 1.1:
+            # next_img_warp should be placed beneath base_img.
+            # Put a mask on next_img_warp using base_img_warp
+            (_, data_map) = cv2.threshold(cv2.cvtColor(base_img_warp, cv2.COLOR_BGR2GRAY),
+                                          0, 255, cv2.THRESH_BINARY)
+            next_img_mask = np.bitwise_not(data_map)
+            print("Creating mask for next_img using base_img_warp.")
+        elif scale is not None and scale < 0.9:
+            # next_img_warp should be placed on top of base_img.
+            (_, data_map) = cv2.threshold(cv2.cvtColor(next_img_warp, cv2.COLOR_BGR2GRAY),
+                                          0, 255, cv2.THRESH_BINARY)
+            base_img_mask = cv2.bitwise_not(data_map)
+            print("Creating mask for base_img using next_img_warp.")
+
+    # TODO: wouldn't it be better to use an alpha channel instead of relying on pixel grayscale value?
+    # If we have black areas on the actual image, we don't want that to be masked out.
+
+    # cv2.add returns None or dst? It returns dst - and src/src1/src2 are not changed.
+    enlarged_base_img = cv2.add(enlarged_base_img, base_img_warp,
+                                mask=base_img_mask, dtype=cv2.CV_8U)
+
+    if next_img_mask is not None:
+        #next_img_warp =
+        #final_img = cv2.add(enlarged_base_img, next_img_warp,
+        #                    mask=next_img_mask, dtype=cv2.CV_8U)
+        print("Putting next_img beneath base_img")
+        #final_img = cv2.bitwise_or(enlarged_base_img, next_img_warp)#, mask=next_img_mask)
+        #next_img_warp = cv2.multiply(next_img_warp, cv2.bitwise_not(enlarged_base_img))
+        next_img_warp = cv2.bitwise_and(cv2.bitwise_not(enlarged_base_img), next_img_warp)
+        final_img = cv2.max(enlarged_base_img, next_img_warp)
+    else:
+        # Un-biased blending (takes the brightest value at every pixel, regardless of order)
+        print("Blending next_img with base_img using unbiased max/lighten.")
+        final_img = cv2.max(enlarged_base_img, next_img_warp)
+
     return final_img
 
 
